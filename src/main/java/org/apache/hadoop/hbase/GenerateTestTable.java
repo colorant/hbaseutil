@@ -22,28 +22,30 @@ import static org.junit.Assert.*;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
-import java.util.Set;
-
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hbase.DataGenUtil.ColType;
 import org.apache.hadoop.hbase.client.HBaseAdmin;
 import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.Put;
+import org.apache.hadoop.hbase.io.hfile.CacheConfig;
 import org.apache.hadoop.hbase.io.hfile.Compression;
+import org.apache.hadoop.hbase.io.hfile.HFileDataBlockEncoder;
+import org.apache.hadoop.hbase.io.hfile.HFileDataBlockEncoderImpl;
 import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;
 
+import org.apache.hadoop.hbase.mapreduce.LoadIncrementalHFiles;
 import org.apache.hadoop.hbase.mapreduce.TableInputFormat;
 import org.apache.hadoop.hbase.mapreduce.TableMapReduceUtil;
 import org.apache.hadoop.hbase.mapreduce.TableSplit;
+import org.apache.hadoop.hbase.regionserver.Store;
+import org.apache.hadoop.hbase.regionserver.StoreFile;
 import org.apache.hadoop.hbase.util.Bytes;
 import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.mapreduce.InputFormat;
@@ -63,10 +65,13 @@ class KEY {
   public static final String CF_PREIX = "test_key_cfprefix";
   public static final String COL_PREIX = "test_key_colprefix";
   public static final String OPTION_COLSFORMAT = "test_key_colsformat";
+  public static final String OPTION_USEBULKLOAD = "test_key_usebulkload";
   public static String OPTION_ROWNUM = "test_key_rownum";
   public static String OPTION_BASEROWNUM = "test_key_baserownum";
   public static String OPTION_REGIONROWNUM = "test_key_regionrownum";
+
   public static long BATCHNUM = 1000;
+  public static String BULKLOADDIR = "/bulkload/";
 }
 
 class DataGenUtil {
@@ -75,9 +80,21 @@ class DataGenUtil {
   
   public static String[] genSequenceStrings(String s, int n) {
     String result[] = new String[n];
-    for (int i = 0; i < n; i++) {
-      result[i] = (s + Integer.toString(i));
+    int numberWidth = 0;
+
+    for (int i = 1; i < n; i *= 10) {
+      numberWidth++;
     }
+
+    for (int i = 0; i < n; i++) {
+      result[i] = Integer.toString(i);
+      int padding  = numberWidth - result[i].length();
+      for (int j = 0; j < padding; j++) {
+        result[i] = "0" + result[i];
+      }
+      result[i] = s + result[i];
+    }
+
     return result;
   }
 
@@ -343,11 +360,18 @@ class GenerateRegionDataTask extends
   private String cfPrefix = null;
   private String colPrefix = null;
   private HTable ht = null;
-  
-  private Random numberGenerator = new Random();
-  
+  private String[] families = null;
+  private String[] columns = null;
+
   private Configuration conf;
   private DataGenUtil.ColFormat[] ColsFormat;
+  private BulkWriter[] bulkWriters;
+
+  private boolean useBulkload = false;
+
+  public class BulkWriter {
+    StoreFile.Writer writer = null;
+  }
 
   @Override
   protected void setup(Context context) throws IOException,
@@ -361,6 +385,11 @@ class GenerateRegionDataTask extends
     this.cfPrefix = conf.get(KEY.CF_PREIX, "F");
     this.colPrefix = conf.get(KEY.COL_PREIX, "C");
 
+    families = DataGenUtil.genSequenceStrings(cfPrefix, this.cfNum);
+    columns = DataGenUtil.genSequenceStrings(colPrefix, this.colNum);
+    
+    this.useBulkload  = conf.getBoolean(KEY.OPTION_USEBULKLOAD, false);
+
     String colsFormatString = conf.get(KEY.OPTION_COLSFORMAT, "");
     
     DataGenUtil dataGenUtil = new DataGenUtil();
@@ -371,16 +400,67 @@ class GenerateRegionDataTask extends
     } catch (IOException e) {
       assertNull("Failed to create table", e);
     }
+
+    if (this.useBulkload) {
+      bulkWriters = new BulkWriter[this.cfNum];
+      Path bulkOutputPath = new Path(KEY.BULKLOADDIR + tableName);
+      FileSystem fs = bulkOutputPath.getFileSystem(conf);
+      
+      for (int i = 0; i < families.length; i++) {
+        String family = families[i];
+        Path cfPath = new Path(bulkOutputPath, family);
+        
+        if (!fs.exists(cfPath)) {
+          fs.mkdirs(cfPath);
+        }
+
+        HColumnDescriptor cfDesc = ht.getTableDescriptor().getFamily(family.getBytes());
+        HFileDataBlockEncoder dataBlockEncoder = new HFileDataBlockEncoderImpl(
+            cfDesc.getDataBlockEncodingOnDisk(),
+            cfDesc.getDataBlockEncoding());
+        
+        Configuration tempConf = new Configuration(conf);
+
+        BulkWriter w = new BulkWriter();
+
+        w.writer = new StoreFile.WriterBuilder(conf, new CacheConfig(tempConf),
+            fs, cfDesc.getBlocksize())
+            .withOutputDir(cfPath)
+            .withCompression(cfDesc.getCompression())
+            .withBloomType(cfDesc.getBloomFilterType())
+            .withComparator(KeyValue.COMPARATOR)
+            .withDataBlockEncoder(dataBlockEncoder)
+            .withChecksumType(Store.getChecksumType(conf))
+            .withBytesPerChecksum(Store.getBytesPerChecksum(conf))
+            .build();
+        
+        bulkWriters[i] = w;
+      }
+    }
     
   }
 
   @Override
   protected void cleanup(Context context) throws IOException,
       InterruptedException {
-//    context.getCounter(CounterType.ROWS).increment(this.cmd.rows.get());
-//    context.getCounter(CounterType.KVS).increment(this.cmd.kvs.get());
+
     if (ht != null)
       ht.close();
+
+    if (this.useBulkload) {
+      for (BulkWriter w : this.bulkWriters) {
+        w.writer.appendFileInfo(StoreFile.BULKLOAD_TIME_KEY,
+            Bytes.toBytes(System.currentTimeMillis()));
+        w.writer.appendFileInfo(StoreFile.BULKLOAD_TASK_KEY,
+            Bytes.toBytes(context.getTaskAttemptID().toString()));
+        w.writer.appendFileInfo(StoreFile.MAJOR_COMPACTION_KEY,
+            Bytes.toBytes(true));
+        w.writer.appendFileInfo(StoreFile.EXCLUDE_FROM_MINOR_COMPACTION_KEY,
+            Bytes.toBytes(false));
+        w.writer.appendTrackedTimestampsToMetadata();
+        w.writer.close();
+      }
+    }
   }
 
   @Override
@@ -401,15 +481,31 @@ class GenerateRegionDataTask extends
     context.progress();
   }
   
-  private void doWrite(String rowPrefix, Long rows, final Context context) throws IOException {
+  private String longToStringPadding(int width, long val) {
+    String result = Long.toString(val);
+    int padding  = width - result.length();
 
-    String[] familys = DataGenUtil.genSequenceStrings(cfPrefix, this.cfNum);
-    String[] columns = DataGenUtil.genSequenceStrings(colPrefix, this.colNum);
+    for (int i = 0; i < padding; i++) {
+      result = "0" + result;
+    }
+    return result;
+  }
+  
+  private void doWrite(String rowPrefix, Long rows, final Context context) throws IOException {
 
     long remainRows = rows;
     long index = 0;
     int toProcess;
     String row = null;
+    Put p = null;
+    BulkWriter w = null;
+
+    long ts = this.useBulkload ? System.currentTimeMillis() : HConstants.LATEST_TIMESTAMP;
+
+    int rowWidth = 0;
+    for (long i = 1L; i < rows; i *= 10L) {
+      rowWidth++;
+    }
 
     while (remainRows > 0) {
       toProcess = (int) KEY.BATCHNUM;
@@ -419,37 +515,47 @@ class GenerateRegionDataTask extends
       List<Put> putList = new ArrayList<Put>(toProcess);
 
       for (int i = 0; i < toProcess; i++) {
-        row = rowPrefix + Long.toString(index);
+        row = rowPrefix + longToStringPadding(rowWidth, index);
+        if (!this.useBulkload) {
+          p = new Put(Bytes.toBytes(row));
+          p.setWriteToWAL(false);
+        }
 
-        Put p = new Put(Bytes.toBytes(row));
-        p.setWriteToWAL(false);
-        for (String family : familys) {
+        for (int fIndex = 0; fIndex < families.length; fIndex++) {
+          String family = families[fIndex];
+
+          if (this.useBulkload) {
+            w = this.bulkWriters[fIndex];
+          }
+
           for (int cIndex = 0; cIndex < columns.length; cIndex++) {
             String column = columns[cIndex];
             KeyValue kv;
             switch (this.ColsFormat[cIndex].type) {
             case NUMINT:
               kv = new KeyValue(Bytes.toBytes(row), Bytes.toBytes(family),
-                  Bytes.toBytes(column), HConstants.LATEST_TIMESTAMP,
-                  KeyValue.Type.Put, Bytes.toBytes(DataGenUtil.genRandomInt(
+                  Bytes.toBytes(column), ts,
+                  KeyValue.Type.Put,
+                  Bytes.toBytes(DataGenUtil.genRandomInt(
                       ((DataGenUtil.ColIntRange)this.ColsFormat[cIndex]).min,
                       ((DataGenUtil.ColIntRange)this.ColsFormat[cIndex]).max
                       )));
               break;
             case NUMLONG:
               kv = new KeyValue(Bytes.toBytes(row), Bytes.toBytes(family),
-                  Bytes.toBytes(column), HConstants.LATEST_TIMESTAMP,
-                  KeyValue.Type.Put, Bytes.toBytes(DataGenUtil.genRandomLong()));
+                  Bytes.toBytes(column), ts,
+                  KeyValue.Type.Put,
+                  Bytes.toBytes(DataGenUtil.genRandomLong()));
               break;
             case STRSEQ:
               kv = new KeyValue(Bytes.toBytes(row), Bytes.toBytes(family),
-                  Bytes.toBytes(column), HConstants.LATEST_TIMESTAMP,
+                  Bytes.toBytes(column), ts,
                   KeyValue.Type.Put,
                   Bytes.toBytes("v" + "-" + column + "-" + row));
               break;
             case TEXTRANDOM:
               kv = new KeyValue(Bytes.toBytes(row), Bytes.toBytes(family),
-                  Bytes.toBytes(column), HConstants.LATEST_TIMESTAMP,
+                  Bytes.toBytes(column), ts,
                   KeyValue.Type.Put,
                   Bytes.toBytes(DataGenUtil.genRandomString(
                       ((DataGenUtil.ColTextRandom)this.ColsFormat[cIndex]).minLength,
@@ -457,22 +563,32 @@ class GenerateRegionDataTask extends
               break;
             default:
               kv = new KeyValue(Bytes.toBytes(row), Bytes.toBytes(family),
-                  Bytes.toBytes(column), HConstants.LATEST_TIMESTAMP,
+                  Bytes.toBytes(column), ts,
                   KeyValue.Type.Put,
                   Bytes.toBytes("v" + "-" + column + "-" + row));
               break;
             }
 
             //KeyValue kv = KeyValueTestUtil.create(row, family, column,
-            //    HConstants.LATEST_TIMESTAMP, "v" + "-" + column + "-" + row);
-            p.add(kv);
+            //    ts, "v" + "-" + column + "-" + row);
+            
+            if (!this.useBulkload) {
+              p.add(kv);
+            } else {
+              w.writer.append(kv);
+            }
           }
         }
-        putList.add(p);
+
+        if (!this.useBulkload) {
+          putList.add(p);
+        }
         index++;
       }
 
-      ht.put(putList);
+      if (!this.useBulkload) {
+        ht.put(putList);
+      }
       remainRows -= toProcess;
     }
   }
@@ -518,6 +634,8 @@ public class GenerateTestTable {
 
   private Compression.Algorithm compression = Compression.Algorithm.NONE;
   private DataBlockEncoding encoding = DataBlockEncoding.NONE;
+
+  private boolean useBulkLoad = false;
 
 
   /**
@@ -683,13 +801,12 @@ public class GenerateTestTable {
     }
   }
 
-  private void deleteTable(String tableName) {
-    try {
-      admin.disableTable(tableName);
-      admin.deleteTable(tableName);
-    } catch (IOException e) {
-      assertNull("Failed to delete table", e);
-    }
+  public void doBulkLoad() throws Exception {
+    
+    HTable ht = new HTable(conf, this.tableName);
+    new LoadIncrementalHFiles(conf).doBulkLoad(new Path(KEY.BULKLOADDIR + tableName), ht);
+    ht.close();
+    // We don't support bulkload for dot yet.
   }
 
   public void doMajorCompact() throws Exception {
@@ -701,7 +818,7 @@ public class GenerateTestTable {
     if (this.createDotTable)
       admin.majorCompact(this.dotTableName);
   }
-
+  
   public void createTable() throws Exception {
 
     String familys[] = DataGenUtil.genSequenceStrings(cfPrefix, this.cfNum);
@@ -739,6 +856,7 @@ public class GenerateTestTable {
     System.err.println("--table=tablename [--rownum=] [--colnum=] [--cfnum=] [--regions=] [--enabledot]");
     System.err.println("[--colsformat=i:min:max(int),|l(long),|s(sequence string),|t:minlengh:maxlength(random text),]");
     System.err.println("[--encoding=prefix|diff|fastdiff|none] [--compression=gz|lzo|snappy|none]");
+    System.err.println("[--usebulkload]");
     System.err.println();
   }
 
@@ -827,7 +945,13 @@ public class GenerateTestTable {
         this.createDotTable  = true;    
         continue;
       }
-      
+
+      final String usebulkload = "--usebulkload";
+      if (cmd.startsWith(usebulkload)) {
+        this.useBulkLoad  = true;    
+        continue;
+      }
+
       final String compressionOP = "--compression=";
       if (cmd.startsWith(compressionOP)) {
         String compressionCodec = cmd.substring(compressionOP.length());
@@ -894,6 +1018,8 @@ public class GenerateTestTable {
     this.conf.setLong(KEY.OPTION_BASEROWNUM, this.baseRowNumber);
     this.conf.setLong(KEY.OPTION_REGIONROWNUM , this.rowNum / this.regionNumber);
 
+    this.conf.setBoolean(KEY.OPTION_USEBULKLOAD, useBulkLoad);
+
     System.out.println("cfnum = " + this.cfNum);
     System.out.println("colnum = " + this.colNum);
     System.out.println("colsFormat = " + colsFormat);
@@ -905,6 +1031,7 @@ public class GenerateTestTable {
     System.out.println("Also create dot table = " + this.createDotTable);
     System.out.println("Data Block Encoding = " + this.encoding);
     System.out.println("Compression = " + this.compression);
+    System.out.println("Use BulkLoad = " + this.useBulkLoad);
     return errCode;
   }
 
@@ -935,9 +1062,14 @@ public class GenerateTestTable {
           GenerateRegionDataTask.class,
           gt.dotTableName, gt.cfPrefix, gt.dotColPrefix);
     }
-    
-    System.out.println("######## Major compacting table... ###########");
-    gt.doMajorCompact();
+
+    if (gt.useBulkLoad) {
+      System.out.println("######## bulkloading table... ###########");
+      gt.doBulkLoad();
+    } else {
+      System.out.println("######## Major compacting table... ###########");
+      gt.doMajorCompact();
+    }
   }
   
   /**
@@ -968,6 +1100,14 @@ public class GenerateTestTable {
       gt.doMapReduce(RegionWriteInputFormat.class,
           GenerateRegionDataTask.class,
           gt.dotTableName, gt.cfPrefix, gt.colPrefix);
+    }
+    
+    if (gt.useBulkLoad) {
+      System.out.println("######## bulkloading table... ###########");
+      gt.doBulkLoad();
+    } else {
+      System.out.println("######## Major compacting table... ###########");
+      gt.doMajorCompact();
     }
   }
 }
